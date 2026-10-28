@@ -442,12 +442,7 @@ def _step5_replicated_group_rank(
     tp_size: int,
     tp_rank: int,
 ) -> tuple[int, int]:
-    """Map a TP rank to one replicated provider/KV group.
-
-    The DSA kernels consume exactly one local KV/provider group.
-    Consequently global groups may be replicated across ranks, but multiple
-    groups cannot be co-located on one rank.
-    """
+    """Return the contiguous provider partition and its replication count."""
     total_groups = int(total_groups)
     tp_size = int(tp_size)
     tp_rank = int(tp_rank)
@@ -458,11 +453,12 @@ def _step5_replicated_group_rank(
         )
     if not 0 <= tp_rank < tp_size:
         raise ValueError(f"Step5 TP rank must be in [0, {tp_size}), got {tp_rank}.")
-    if tp_size < total_groups or tp_size % total_groups != 0:
+    if tp_size < total_groups and total_groups % tp_size == 0:
+        return tp_rank, 1
+    if tp_size % total_groups != 0:
         raise ValueError(
-            "Step5 DSA kernels require exactly one local "
-            "provider/KV group, so the global group count must divide tensor "
-            "parallel size and cannot exceed it; got "
+            "Step5 provider groups and tensor parallel size must divide "
+            "one another; got "
             f"groups={total_groups}, tp_size={tp_size}."
         )
     ranks_per_group = tp_size // total_groups
@@ -515,13 +511,6 @@ def _validate_step5_dsa_parallel_geometry(
         raise ValueError(
             "local DSA provider groups must align with local KV groups: "
             f"{local_provider_groups} != {local_kv_groups}"
-        )
-    if local_kv_groups != 1:
-        raise ValueError(
-            "Step5 DSA kernels require exactly one local "
-            "KV/provider group per tensor-parallel rank, got "
-            f"local_groups={local_kv_groups} "
-            f"(global_groups={total_num_kv_heads}, tp_size={tp_size})."
         )
     if total_num_heads % tp_size:
         raise ValueError(
@@ -660,12 +649,9 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             self.index_kv_head_replicas = 1
         # The sparse indexer q heads are sharded into `index_tp_size` global
         # provider groups (default 4, matching the main-attention KV groups).
-        # The DSA kernels consume one group per rank, so each group is
-        # replicated across tp_size // index_tp_size ranks. This keeps the
-        # per-rank index q-head set -- and therefore the GQA sparse-topk
-        # aggregation -- identical at TP4/TP8/TP16. Splitting q across the full
-        # tp_size instead would shrink the aggregation group and corrupt sparse
-        # region selection.
+        # Keep complete provider groups together. TP below the provider count
+        # places several groups on each rank; larger TP replicates each group.
+        # Never split the scoring heads within a provider group.
         index_tp_size = int(index_tp_size)
         if index_tp_size <= 0:
             index_tp_size = tp_size
@@ -706,7 +692,7 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             index_tp_size=index_tp_size,
             tp_size=tp_size,
         )
-        self.local_index_q_heads = total_index_q_heads // index_tp_size
+        self.local_index_q_heads = total_index_q_heads // min(index_tp_size, tp_size)
         self.index_q_head_replicas = ranks_per_index
         self.local_gate_size = (
             typing.cast(int, gate_output_size) // tp_size if self.has_gate else 0
@@ -946,7 +932,7 @@ class Step5SparseIndexerIndexTPLinear(nn.Module):
                 f"index_tp_size, got output_size={output_size}, "
                 f"index_tp_size={index_tp_size}."
             )
-        self.output_size_per_partition = output_size // index_tp_size
+        self.output_size_per_partition = output_size // min(index_tp_size, tp_size)
         self.weight = Parameter(
             torch.empty(
                 self.output_size_per_partition,
