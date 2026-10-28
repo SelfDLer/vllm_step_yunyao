@@ -54,6 +54,7 @@ class PerceptionEncoderConfig(PretrainedConfig):
 
 class Step5Config(PretrainedConfig):
     model_type = "step5"
+    attribute_map = {"num_experts": "moe_num_experts"}
 
     def __init__(
         self,
