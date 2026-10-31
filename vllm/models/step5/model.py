@@ -6,6 +6,7 @@ import copy
 import functools
 import typing
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
 import regex as re
@@ -832,13 +833,7 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
         return required
 
     def assert_fully_loaded(self, prefix: str) -> None:
-        """Fail unless this load covered every shard, then forget the record.
-
-        Tracking per load (instead of latching a flag on first success) is what
-        makes weight reloading safe: a reload materializes fresh uninitialized
-        storage for the whole parameter, so a shard the new weight stream omits
-        would otherwise silently become garbage.
-        """
+        """Check coverage without discarding evidence from a failed update."""
         required = self.required_shard_ids()
         missing = sorted(required - self._loaded_shards)
         if missing:
@@ -846,7 +841,6 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
                 f"Incomplete fused qkv+indexer weight for {prefix}: "
                 f"missing shards {missing}."
             )
-        self._loaded_shards.clear()
 
     def reset_load_state(self) -> None:
         self._loaded_shards.clear()
@@ -901,7 +895,62 @@ def _validate_fused_qkv_indexer_weights(module: nn.Module) -> set[str]:
         param_name = f"{name}.weight" if name else "weight"
         submodule.assert_fully_loaded(param_name)
         loaded_params.add(param_name)
+    _reset_fused_qkv_indexer_load_state(module)
     return loaded_params
+
+
+@dataclass
+class _Step5WeightLoadState:
+    loaded_params: set[str] = field(default_factory=set)
+    expected_params: set[str] | None = None
+    failed: bool = False
+
+
+def _begin_step5_weight_load(
+    owner: nn.Module, module: nn.Module
+) -> _Step5WeightLoadState | None:
+    from vllm.model_executor.model_loader.mtp_validation import (
+        is_mtp_completeness_check_enabled,
+    )
+
+    state = getattr(owner, "_step5_weight_load_state", None)
+    if not is_mtp_completeness_check_enabled():
+        if state is not None:
+            raise RuntimeError("Cannot mix guarded and unfinished Step5 weight updates")
+        return None
+    if state is None:
+        _reset_fused_qkv_indexer_load_state(module)
+        state = _Step5WeightLoadState()
+        owner._step5_weight_load_state = state
+    elif state.failed:
+        raise RuntimeError("A failed Step5 weight update requires a fresh model")
+    return state
+
+
+def _finish_step5_weight_load(
+    owner: nn.Module, module: nn.Module, expected_params: set[str] | None = None
+) -> None:
+    state = getattr(owner, "_step5_weight_load_state", None)
+    if state is None:
+        # Dummy initialization and externally guarded updates own no state here.
+        return
+    if state.failed:
+        raise RuntimeError("A failed Step5 weight update requires a fresh model")
+    try:
+        if state.expected_params is not None:
+            expected_params = state.expected_params
+        if expected_params is not None:
+            missing = expected_params - state.loaded_params
+            if missing:
+                raise RuntimeError(
+                    "Incomplete Step5 weight update: missing parameters "
+                    f"{sorted(missing)}"
+                )
+        _validate_fused_qkv_indexer_weights(module)
+    except Exception:
+        state.failed = True
+        raise
+    owner._step5_weight_load_state = None
 
 
 class Step5SparseIndexerIndexTPLinear(nn.Module):
@@ -2921,24 +2970,20 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             moe.experts.update_expert_map()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm.model_executor.model_loader.mtp_validation import (
-            is_mtp_completeness_check_enabled,
-        )
+        state = _begin_step5_weight_load(self, self.model)
+        try:
+            skip_prefixes = ["vision_model."]
+            if self.config.tie_word_embeddings:
+                skip_prefixes.append("lm_head.")
+            loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+            loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+            if state is not None:
+                state.loaded_params.update(loaded)
+            return loaded
+        except Exception:
+            if state is not None:
+                state.failed = True
+            raise
 
-        validate_completeness = is_mtp_completeness_check_enabled()
-        if validate_completeness:
-            _reset_fused_qkv_indexer_load_state(self.model)
-        skip_prefixes = ["vision_model."]
-        if self.config.tie_word_embeddings:
-            skip_prefixes.append("lm_head.")
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=skip_prefixes,
-        )
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        if validate_completeness:
-            loaded_params.update(
-                f"model.{name}"
-                for name in _validate_fused_qkv_indexer_weights(self.model)
-            )
-        return loaded_params
+    def process_weights_after_loading(self) -> None:
+        _finish_step5_weight_load(self, self.model)

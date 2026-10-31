@@ -28,10 +28,10 @@ from .model import (
     STEP5_PACKED_MODULES_MAPPING,
     Step5DecoderLayer,
     Step5MoE,
+    _begin_step5_weight_load,
+    _finish_step5_weight_load,
     _require_resolved_valid_vocab_size,
-    _reset_fused_qkv_indexer_load_state,
     _set_step5_moe_protocol_metadata,
-    _validate_fused_qkv_indexer_weights,
 )
 
 logger = init_logger(__name__)
@@ -320,16 +320,29 @@ class Step5MTP(nn.Module, MixtureOfExperts):
             moe.experts.update_expert_map()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm.model_executor.model_loader.mtp_validation import (
-            is_mtp_completeness_check_enabled,
-        )
+        state = _begin_step5_weight_load(self, self)
+        if state is not None and state.expected_params is None:
+            # Snapshot checkpoint parameter names before postprocessing can
+            # replace them with runtime-only quantization parameters.
+            state.expected_params = set(dict(self.named_parameters()))
+        try:
+            loaded = self._load_weights(weights)
+            if state is not None:
+                state.loaded_params.update(loaded)
+            return loaded
+        except Exception:
+            if state is not None:
+                state.failed = True
+            raise
+
+    def process_weights_after_loading(self) -> None:
+        _finish_step5_weight_load(self, self)
+
+    def _load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         from vllm.model_executor.model_loader.weight_utils import (
             default_weight_loader,
         )
 
-        validate_completeness = is_mtp_completeness_check_enabled()
-        if validate_completeness:
-            _reset_fused_qkv_indexer_load_state(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkvg_proj", "q_proj", 0),
@@ -515,16 +528,6 @@ class Step5MTP(nn.Module, MixtureOfExperts):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
-        if validate_completeness:
-            loaded_params.update(_validate_fused_qkv_indexer_weights(self))
-        missing_params = set(params_dict).difference(loaded_params)
-        if missing_params and is_mtp_completeness_check_enabled():
-            param_name_example = min(missing_params)
-            raise RuntimeError(
-                "Some parameters like "
-                f"{param_name_example} are not in the checkpoint and will falsely "
-                "use random initialization"
-            )
         return loaded_params
 
     def _rewrite_spec_layer_name(self, spec_layer: int | None, name: str) -> str:

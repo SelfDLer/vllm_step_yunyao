@@ -603,36 +603,11 @@ def test_fused_qkv_indexer_rejects_malformed_fused_checkpoint_weight():
         projection.weight_loader_v2(param, torch.zeros(7, 4))
 
 
-def test_step5_full_load_validates_but_weight_transfer_can_be_partial(monkeypatch):
-    calls: list[str] = []
-
-    class FakeStep5Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.projection = _make_fused_projection()
-
-    class FakeLoader:
-        def __init__(self, _module, **_kwargs):
-            pass
-
-        def load_weights(self, _weights, *, mapper):
-            del mapper
-            calls.append("load")
-            return set()
-
-    model = SimpleNamespace(
-        config=SimpleNamespace(tie_word_embeddings=False),
-        hf_to_vllm_mapper=object(),
-        model=FakeStep5Model(),
-    )
-    monkeypatch.setattr(step5_model, "AutoWeightsLoader", FakeLoader)
-
-    with pytest.raises(ValueError, match="Incomplete fused qkv"):
-        step5_model.Step5ForCausalLM.load_weights(model, [])
-
-    with disable_mtp_completeness_check():
-        assert step5_model.Step5ForCausalLM.load_weights(model, []) == set()
-    assert calls == ["load", "load"]
+def test_step5_full_load_validates_at_finalization(monkeypatch):
+    model = _make_streaming_text_model(monkeypatch)
+    assert model.load_weights([]) == set()
+    with pytest.raises(ValueError, match="Incomplete"):
+        model.process_weights_after_loading()
 
 
 def _make_weight_module() -> nn.Module:
@@ -1223,3 +1198,375 @@ def test_router_bias_cpu_fallback_preserves_reference_semantics(
     assert ids.dtype == torch.int64
     assert ids[0].tolist() == expected_ids.tolist()
     assert ids[1].tolist() == [7, 7]
+
+
+def _make_streaming_projection(monkeypatch, *, tp_size=1, tp_rank=0):
+    from vllm.model_executor import parameter as parameter_module
+
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_rank", lambda: tp_rank
+    )
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    projection = _make_fused_projection()
+    projection.tp_rank = tp_rank
+    projection.num_heads = 2
+    projection.num_kv_heads = 1
+    projection.head_size = projection.v_head_size = 1
+    projection.num_kv_head_replicas = min(2, tp_size)
+    projection.qkv_size = 4
+    projection.proxy_dim = 1
+    projection.local_index_q_heads = 2
+    projection.local_index_kv_heads = 1
+    index_groups = min(2, tp_size)
+    projection.index_tp_rank = tp_rank // (tp_size // index_groups)
+    projection.index_kv_head_replicas = min(2, tp_size)
+    projection.local_gate_size = 1
+    kv_heads = tp_size // min(2, tp_size)
+    projection._fused_checkpoint_shard_sizes = (
+        ("q", 2 * tp_size),
+        ("k", kv_heads),
+        ("v", kv_heads),
+        ("index_q", 2 * index_groups),
+        ("index_k", kv_heads),
+        ("index_z", kv_heads),
+        ("index_g", tp_size),
+    )
+    projection.weight = parameter_module.ModelWeightParameter(
+        data=torch.zeros(9, 4),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=projection.weight_loader_v2,
+    )
+    return projection
+
+
+def _make_streaming_text_model(monkeypatch, *, tp_size=1, tp_rank=0):
+    text = step5_model.Step5ForCausalLM.__new__(step5_model.Step5ForCausalLM)
+    nn.Module.__init__(text)
+    text.config = SimpleNamespace(tie_word_embeddings=False)
+    text.model = step5_model.Step5Model.__new__(step5_model.Step5Model)
+    nn.Module.__init__(text.model)
+    text.model.layers = nn.ModuleList()
+    for _ in range(2):
+        layer = nn.Module()
+        layer.self_attn = nn.Module()
+        layer.self_attn.qkv_indexer_proj = _make_streaming_projection(
+            monkeypatch, tp_size=tp_size, tp_rank=tp_rank
+        )
+        text.model.layers.append(layer)
+    text.model.config = SimpleNamespace(
+        num_attention_groups=2, num_hidden_layers=2, moe_num_experts=0
+    )
+    text.model.vllm_config = SimpleNamespace(quant_config=None)
+    text.model.moe_num_experts = 0
+    text.lm_head = _make_weight_module()
+    return text
+
+
+def _streaming_checkpoint(model, *, generation=1):
+    suffixes = {
+        "q": "q_proj",
+        "k": "k_proj",
+        "v": "v_proj",
+        "index_q": "sparse_indexer_q",
+        "index_k": "sparse_indexer_k",
+        "index_z": "sparse_indexer_z",
+        "index_g": "g_proj",
+    }
+    weights: list[tuple[str, torch.Tensor]] = []
+    for layer_id, layer in enumerate(model.model.layers):
+        projection = layer.self_attn.qkv_indexer_proj
+        for shard_id, rows in projection._fused_checkpoint_shard_sizes:
+            values = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
+            values += 1000 * generation + 100 * layer_id + 10 * len(weights)
+            weights.append(
+                (
+                    f"model.layers.{layer_id}.self_attn.{suffixes[shard_id]}.weight",
+                    values,
+                )
+            )
+    weights.append(("lm_head.weight", torch.tensor([float(generation)])))
+    return weights
+
+
+def _assert_same_streaming_parameters(actual, expected):
+    actual_params = dict(actual.named_parameters())
+    expected_params = dict(expected.named_parameters())
+    assert actual_params.keys() == expected_params.keys()
+    for name in actual_params:
+        torch.testing.assert_close(
+            actual_params[name], expected_params[name], rtol=0, atol=0, msg=name
+        )
+
+
+@pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 1), (8, 7)])
+def test_step5_streamed_real_tensor_load_matches_full_and_releases_buckets(
+    monkeypatch, tp_size, tp_rank
+):
+    """Every constituent may cross buckets; IPC storage can be reused after ACK."""
+    full = _make_streaming_text_model(monkeypatch, tp_size=tp_size, tp_rank=tp_rank)
+    streamed = _make_streaming_text_model(monkeypatch, tp_size=tp_size, tp_rank=tp_rank)
+    expected_names = set(dict(full.named_parameters()))
+    assert full.load_weights(_streaming_checkpoint(full)) == expected_names
+    full.process_weights_after_loading()
+    loaded = set()
+    for name, tensor in reversed(_streaming_checkpoint(streamed)):
+        loaded.update(streamed.load_weights([(name, tensor)]))
+        tensor.fill_(-999)
+    assert loaded == expected_names
+    streamed.process_weights_after_loading()
+    _assert_same_streaming_parameters(streamed, full)
+
+
+@pytest.mark.parametrize("omission", ["index_g", "whole_layer"])
+def test_step5_streamed_second_update_cannot_reuse_previous_coverage(
+    monkeypatch, omission
+):
+    model = _make_streaming_text_model(monkeypatch)
+    for generation in (1, 2):
+        expected = _make_streaming_text_model(monkeypatch)
+        expected.load_weights(_streaming_checkpoint(expected, generation=generation))
+        expected.process_weights_after_loading()
+        for item in _streaming_checkpoint(model, generation=generation):
+            model.load_weights([item])
+        model.process_weights_after_loading()
+        _assert_same_streaming_parameters(model, expected)
+    for name, tensor in _streaming_checkpoint(model, generation=3):
+        if omission == "index_g" and name == "model.layers.1.self_attn.g_proj.weight":
+            continue
+        if omission == "whole_layer" and name.startswith("model.layers.1."):
+            continue
+        model.load_weights([(name, tensor)])
+    with pytest.raises(ValueError, match="Incomplete"):
+        model.process_weights_after_loading()
+
+
+def test_step5_failed_fused_check_preserves_all_layer_records():
+    model = nn.Module()
+    required = {"q", "k", "v", "index_q", "index_k", "index_z", "index_g"}
+    model.first = _make_fused_projection(*required)
+    model.second = _make_fused_projection(*(required - {"index_g"}))
+    with pytest.raises(ValueError, match="index_g"):
+        step5_model._validate_fused_qkv_indexer_weights(model)
+    assert model.first._loaded_shards == required
+    assert model.second._loaded_shards == required - {"index_g"}
+
+
+def test_step5_finalizer_accepts_dummy_and_repeated_success(monkeypatch):
+    model = _make_streaming_text_model(monkeypatch)
+    model.process_weights_after_loading()
+    model.load_weights(_streaming_checkpoint(model))
+    model.process_weights_after_loading()
+    model.process_weights_after_loading()
+    assert all(
+        not layer.self_attn.qkv_indexer_proj._loaded_shards
+        for layer in model.model.layers
+    )
+
+
+def test_step5_external_scope_retains_coverage_for_transfer_guard(monkeypatch):
+    model = _make_streaming_text_model(monkeypatch)
+    expected = set(dict(model.named_parameters()))
+    for generation in (1, 2):
+        step5_model._reset_fused_qkv_indexer_load_state(model)
+        loaded = set()
+        with disable_mtp_completeness_check():
+            for item in _streaming_checkpoint(model, generation=generation):
+                loaded.update(model.load_weights([item]))
+            model.process_weights_after_loading()
+        assert loaded == expected
+        step5_model._validate_fused_qkv_indexer_weights(model)
+        model.process_weights_after_loading()
+
+
+def _make_streaming_mtp(monkeypatch):
+    model = step5_mtp.Step5MTP.__new__(step5_mtp.Step5MTP)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        num_hidden_layers=2, num_nextn_predict_layers=1, moe_num_experts=0
+    )
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleDict({"2": nn.Module()})
+    block = nn.Module()
+    block.self_attn = nn.Module()
+    block.self_attn.qkv_indexer_proj = _make_streaming_projection(monkeypatch)
+    block.norm = _make_weight_module()
+    model.model.layers["2"].mtp_block = block
+    model.model.mtp_start_layer_idx = 2
+    model.model.num_mtp_layers = 1
+    return model
+
+
+def test_step5_mtp_streams_real_weights_and_rejects_next_missing_parameter(monkeypatch):
+    model = _make_streaming_mtp(monkeypatch)
+    text = _make_streaming_text_model(monkeypatch)
+    for generation in (1, 2, 3):
+        weights = [
+            (name.replace("model.layers.0.", "model.layers.2."), tensor)
+            for name, tensor in _streaming_checkpoint(text, generation=generation)
+            if name.startswith("model.layers.0.")
+        ]
+        if generation < 3:
+            weights.append(("model.layers.2.norm.weight", torch.tensor([generation])))
+        for item in weights:
+            model.load_weights([item])
+        if generation == 3:
+            with pytest.raises(
+                (ValueError, RuntimeError), match="Incomplete|not initialized|missing"
+            ):
+                model.process_weights_after_loading()
+        else:
+            model.process_weights_after_loading()
+            torch.testing.assert_close(
+                model.model.layers["2"].mtp_block.norm.weight,
+                torch.tensor([float(generation)]),
+            )
+
+
+def test_step5_vl_interleaved_buckets_finalize_nested_text_model(monkeypatch):
+    from vllm.model_executor.models.step5_vl import Step5ForConditionalGeneration
+
+    model = Step5ForConditionalGeneration.__new__(Step5ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.language_model = _make_streaming_text_model(monkeypatch)
+    model.vision_model = _make_weight_module()
+    weights = _streaming_checkpoint(model.language_model)
+    weights.insert(4, ("model.vision_model.weight", torch.tensor([17.0])))
+    for item in weights:
+        model.load_weights([item])
+    model.process_weights_after_loading()
+    torch.testing.assert_close(model.vision_model.weight, torch.tensor([17.0]))
+    model.load_weights([("model.vision_model.weight", torch.tensor([18.0]))])
+    with pytest.raises(ValueError, match="Incomplete"):
+        model.process_weights_after_loading()
+
+
+def test_step5_checkpoint_tracker_preserves_parameter_name_contract(monkeypatch):
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    model = _make_streaming_text_model(monkeypatch)
+    loader = DefaultModelLoader.__new__(DefaultModelLoader)
+    loaded = model.load_weights(_streaming_checkpoint(model))
+    loader.track_weights_loading(model, loaded)
+    model.process_weights_after_loading()
+    partial = model.load_weights(
+        [
+            (name, tensor)
+            for name, tensor in _streaming_checkpoint(model, generation=2)
+            if name != "lm_head.weight"
+        ]
+    )
+    with pytest.raises(ValueError, match="lm_head.weight"):
+        loader.track_weights_loading(model, partial)
+
+
+def test_step5_failed_update_rejects_further_buckets(monkeypatch):
+    model = _make_streaming_text_model(monkeypatch)
+    model.load_weights(_streaming_checkpoint(model)[:-2])
+    with pytest.raises(ValueError, match="Incomplete"):
+        model.process_weights_after_loading()
+    with pytest.raises(RuntimeError, match="fresh model"):
+        model.load_weights(_streaming_checkpoint(model, generation=2))
+    with pytest.raises(RuntimeError, match="fresh model"):
+        model.process_weights_after_loading()
+
+
+def test_step5_does_not_mix_native_guard_with_unfinished_update(monkeypatch):
+    model = _make_streaming_text_model(monkeypatch)
+    model.load_weights(_streaming_checkpoint(model)[:1])
+    with (
+        disable_mtp_completeness_check(),
+        pytest.raises(RuntimeError, match="Cannot mix"),
+    ):
+        model.load_weights(_streaming_checkpoint(model)[1:])
+
+
+def test_step5_tied_embedding_checkpoint_keeps_loaded_name_contract(monkeypatch):
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    model = _make_streaming_text_model(monkeypatch)
+    model.config.tie_word_embeddings = True
+    model.model.embed_tokens = _make_weight_module()
+    model.lm_head = model.model.embed_tokens
+    weights = _streaming_checkpoint(model)
+    weights.append(("model.embed_tokens.weight", torch.tensor([42.0])))
+    loaded = model.load_weights(weights)
+    DefaultModelLoader.__new__(DefaultModelLoader).track_weights_loading(model, loaded)
+    model.process_weights_after_loading()
+    torch.testing.assert_close(model.lm_head.weight, torch.tensor([42.0]))
+
+
+def test_step5_pipeline_missing_layer_does_not_require_remote_shards(monkeypatch):
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    model = _make_streaming_text_model(monkeypatch)
+    weights = _streaming_checkpoint(model)
+    model.model.layers[1] = PPMissingLayer()
+    for item in weights:
+        model.load_weights([item])
+    model.process_weights_after_loading()
+
+
+def test_step5_native_ascend_guard_still_owns_two_updates(monkeypatch):
+    guard_module = pytest.importorskip("vllm_ascend.patch.worker.step5_weight_update")
+    model = _make_streaming_text_model(monkeypatch)
+    for generation in (1, 2):
+        guard = guard_module.Step5WeightUpdateGuard(model)
+        for item in _streaming_checkpoint(model, generation=generation):
+            model.load_weights([item])
+        guard.finish()
+        model.process_weights_after_loading()
+        torch.testing.assert_close(
+            model.lm_head.weight, torch.tensor([float(generation)])
+        )
+
+
+@pytest.mark.parametrize("omit_original_weight", [False, True])
+def test_step5_mtp_validates_checkpoint_names_before_quant_postprocessing(
+    monkeypatch, omit_original_weight
+):
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+    class RenameWeightAfterLoading(QuantizeMethodBase):
+        def create_weights(self, layer, *args, **kwargs):
+            raise AssertionError("The fixture already owns its checkpoint parameter")
+
+        def apply(self, layer, *args, **kwargs):
+            raise AssertionError("This test exercises loading, not inference")
+
+        def process_weights_after_loading(self, layer):
+            values = layer.weight.detach().clone()
+            del layer.weight
+            layer.register_parameter(
+                "runtime_weight", nn.Parameter(values, requires_grad=False)
+            )
+            layer.register_parameter(
+                "runtime_scale", nn.Parameter(torch.ones(1), requires_grad=False)
+            )
+
+    model = _make_streaming_mtp(monkeypatch)
+    text = _make_streaming_text_model(monkeypatch)
+    norm = model.model.layers["2"].mtp_block.norm
+    norm.quant_method = RenameWeightAfterLoading()
+    weights = [
+        (name.replace("model.layers.0.", "model.layers.2."), tensor)
+        for name, tensor in _streaming_checkpoint(text)
+        if name.startswith("model.layers.0.")
+    ]
+    if not omit_original_weight:
+        weights.append(("model.layers.2.norm.weight", torch.tensor([91.0])))
+    for item in weights:
+        model.load_weights([item])
+    config = SimpleNamespace(dtype=torch.float32, quantization=None)
+    if omit_original_weight:
+        with pytest.raises(RuntimeError, match=r"norm\.weight") as error:
+            process_weights_after_loading(model, config, torch.device("cpu"))
+        assert "runtime_" not in str(error.value)
+    else:
+        process_weights_after_loading(model, config, torch.device("cpu"))
+        torch.testing.assert_close(norm.runtime_weight, torch.tensor([91.0]))
+    assert not hasattr(norm, "weight")
+    assert set(dict(norm.named_parameters())) == {"runtime_weight", "runtime_scale"}
